@@ -8,13 +8,18 @@ import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import {
   ArrowLeft, Brush, Check, CircleHelp, Eraser, Eye, EyeOff, FileImage,
   Hand, Layers3, MoreHorizontal, Plus, Redo2, Search, Undo2, X, Download,
-  PenLine, Copy, Trash2,
+  PenLine, Copy, Trash2, Wrench, Wand2, Move, Crop, Type, Play, Pause,
+  Film, Lock, Unlock, RotateCw, ImagePlus, Camera, Share2, Settings,
+  HelpCircle, Clipboard, ClipboardPaste, Shapes, Grid2X2, ChevronRight,
 } from 'lucide-react';
+import { applyCanvasEffect, applyLiquify, drawGeometry, floodFill, type LiquifyMode } from './canvas-ops';
 
-type Layer = { id: string; name: string; visible: boolean; image?: string };
-type Artwork = { id: string; title: string; width: number; height: number; created: number; updated: number; layers: Layer[]; preview?: string };
-type Tool = 'brush' | 'smudge' | 'eraser';
+type Layer = { id: string; name: string; visible: boolean; locked?: boolean; image?: string };
+type AnimationFrame = { id: string; images: Record<string, string>; hold: number; background: boolean };
+type Artwork = { id: string; title: string; width: number; height: number; created: number; updated: number; layers: Layer[]; preview?: string; animation?: AnimationFrame[] };
+type Tool = 'brush' | 'smudge' | 'eraser' | 'selection';
 type Preset = { name: string; color: string; width: number; height: number; detail: string };
+type Point = { x: number; y: number };
 
 const queryClient = new QueryClient();
 const DB_NAME = 'aeternum-paint-studio';
@@ -89,6 +94,50 @@ function AppHome() {
   const [colorOpen, setColorOpen] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
   const [layerMenu, setLayerMenu] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const [actionTab, setActionTab] = useState<'Add' | 'Canvas' | 'Share' | 'Video' | 'Prefs' | 'Help'>('Add');
+  const [adjustmentsOpen, setAdjustmentsOpen] = useState(false);
+  const [activeAdjustment, setActiveAdjustment] = useState('');
+  const [adjustmentValue, setAdjustmentValue] = useState(48);
+  const [liquifyOpen, setLiquifyOpen] = useState(false);
+  const [liquifyMode, setLiquifyMode] = useState<LiquifyMode>('Push');
+  const [liquifyValues, setLiquifyValues] = useState({ amount: 50, size: 70, pressure: 73, distortion: 36, momentum: 85 });
+  const [transformOpen, setTransformOpen] = useState(false);
+  const [transformMode, setTransformMode] = useState<'Freeform' | 'Uniform' | 'Distort' | 'Warp'>('Uniform');
+  const [transformScale, setTransformScale] = useState(100);
+  const [transformSnap, setTransformSnap] = useState(true);
+  const [interpolation, setInterpolation] = useState('Bilinear');
+  const [quickShapeArmed, setQuickShapeArmed] = useState(false);
+  const [quickShapeSnap, setQuickShapeSnap] = useState(true);
+  const [quickShapeOpen, setQuickShapeOpen] = useState(false);
+  const [quickShape, setQuickShape] = useState<'Line' | 'Ellipse' | 'Rectangle'>('Ellipse');
+  const [quickShapeDraft, setQuickShapeDraft] = useState<{ from: Point; to: Point } | null>(null);
+  const [actionsMessage, setActionsMessage] = useState('');
+  const [drawGuide, setDrawGuide] = useState(false);
+  const [guideSettingsOpen, setGuideSettingsOpen] = useState(false);
+  const [guideSpacing, setGuideSpacing] = useState(30);
+  const [pageAssist, setPageAssist] = useState(false);
+  const [referenceEnabled, setReferenceEnabled] = useState(false);
+  const [referenceUrl, setReferenceUrl] = useState('');
+  const [canvasInfoOpen, setCanvasInfoOpen] = useState(false);
+  const [canvasSizeOpen, setCanvasSizeOpen] = useState(false);
+  const [canvasOperation, setCanvasOperation] = useState<'Resize' | 'Crop'>('Resize');
+  const [resizeWidth, setResizeWidth] = useState('');
+  const [resizeHeight, setResizeHeight] = useState('');
+  const [textOpen, setTextOpen] = useState(false);
+  const [textDraft, setTextDraft] = useState('');
+  const [cloneMode, setCloneMode] = useState(false);
+  const [cloneSource, setCloneSource] = useState<Point | null>(null);
+  const [colorDrag, setColorDrag] = useState<Point | null>(null);
+  const [colorDropTarget, setColorDropTarget] = useState<Point | null>(null);
+  const [animationOpen, setAnimationOpen] = useState(false);
+  const [animationPlaying, setAnimationPlaying] = useState(false);
+  const [animationFrameIndex, setAnimationFrameIndex] = useState(0);
+  const [frameOptionsOpen, setFrameOptionsOpen] = useState(false);
+  const [frameHold, setFrameHold] = useState(0);
+  const [frameBackground, setFrameBackground] = useState(false);
+  const [appPreferencesOpen, setAppPreferencesOpen] = useState(false);
+  const [brushStabilization, setBrushStabilization] = useState(0);
   const [saving, setSaving] = useState(false);
   const [paperSize, setPaperSize] = useState({ width: 800, height: 600 });
   const [historyVersion, setHistoryVersion] = useState(0);
@@ -97,6 +146,11 @@ function AppHome() {
   const drawing = useRef(false);
   const points = useRef<{ x: number; y: number; pressure: number }[]>([]);
   const history = useRef<Record<string, { undo: string[]; redo: string[] }>>({});
+  const clipboard = useRef<string | null>(null);
+  const colorDragStart = useRef<Point | null>(null);
+  const colorWasDragged = useRef(false);
+  const ignoreColorClick = useRef(false);
+  const frameTimer = useRef<number | undefined>(undefined);
   const saveTimer = useRef<number | undefined>(undefined);
   const activeLayer = project?.layers.find(layer => layer.id === activeLayerId) ?? project?.layers[0];
 
@@ -236,11 +290,34 @@ function AppHome() {
     context.globalCompositeOperation = 'source-over';
   };
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!activeLayer) return;
+    if (!activeLayer || activeLayer.locked || tool === 'selection') return;
     const canvas = event.currentTarget;
+    event.preventDefault();
     canvas.setPointerCapture(event.pointerId);
-    drawing.current = true;
     const point = pointFromEvent(event);
+    if (cloneMode) {
+      if (!cloneSource) {
+        setCloneSource(point);
+        setActionsMessage('Clone source set. Tap a target area on the canvas.');
+        return;
+      }
+      const radius = Math.max(8, brushSize * 4);
+      const scratch = document.createElement('canvas');
+      scratch.width = radius * 2;
+      scratch.height = radius * 2;
+      scratch.getContext('2d')?.drawImage(canvas, cloneSource.x - radius, cloneSource.y - radius, radius * 2, radius * 2, 0, 0, radius * 2, radius * 2);
+      const stack = history.current[activeLayer.id] ?? { undo: [], redo: [] };
+      stack.undo.push(canvas.toDataURL('image/png'));
+      stack.redo = [];
+      history.current[activeLayer.id] = stack;
+      canvas.getContext('2d')?.drawImage(scratch, point.x - radius, point.y - radius);
+      setCloneSource(null);
+      setCloneMode(false);
+      setActionsMessage('');
+      persist(project!);
+      return;
+    }
+    drawing.current = true;
     const stack = history.current[activeLayer.id] ?? { undo: [], redo: [] };
     stack.undo.push(canvas.toDataURL('image/png'));
     if (stack.undo.length > 40) stack.undo.shift();
@@ -248,6 +325,10 @@ function AppHome() {
     history.current[activeLayer.id] = stack;
     setHistoryVersion(value => value + 1);
     points.current = [point];
+    if (quickShapeArmed) {
+      setQuickShapeDraft({ from: point, to: point });
+      return;
+    }
     const context = canvas.getContext('2d');
     if (context && tool !== 'smudge') {
       context.fillStyle = tool === 'eraser' ? 'rgba(0,0,0,1)' : color;
@@ -272,6 +353,12 @@ function AppHome() {
         y: (nativeEvent.clientY - rect.top) * (event.currentTarget.height / rect.height),
         pressure: nativeEvent.pressure || 0.5,
       };
+      if (quickShapeArmed) {
+        const first = points.current[0] ?? next;
+        points.current.push(next);
+        setQuickShapeDraft({ from: first, to: next });
+        continue;
+      }
       const previous = points.current[points.current.length - 1];
       if (previous) drawSegment(context, previous, next);
       points.current.push(next);
@@ -280,6 +367,11 @@ function AppHome() {
   const onPointerUp = () => {
     if (!drawing.current) return;
     drawing.current = false;
+    if (quickShapeArmed) {
+      setQuickShapeArmed(false);
+      setQuickShapeOpen(true);
+      return;
+    }
     commitStroke();
   };
   const undo = () => {
@@ -313,6 +405,397 @@ function AppHome() {
       setHistoryVersion(v => v + 1);
     };
     image.src = stack.redo.pop()!;
+  };
+
+  const rememberLayer = (id: string) => {
+    const canvas = canvasRefs.current[id];
+    if (!canvas) return;
+    const stack = history.current[id] ?? { undo: [], redo: [] };
+    stack.undo.push(canvas.toDataURL('image/png'));
+    if (stack.undo.length > 40) stack.undo.shift();
+    stack.redo = [];
+    history.current[id] = stack;
+    setHistoryVersion(value => value + 1);
+  };
+  const saveNow = (next = project) => { if (next) persist(next); };
+  const clearLayer = (id: string) => {
+    const canvas = canvasRefs.current[id];
+    if (!canvas) return;
+    rememberLayer(id);
+    canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    saveNow();
+  };
+  const duplicateLayer = (id: string) => {
+    if (!project) return;
+    const source = canvasRefs.current[id];
+    const layer = project.layers.find(item => item.id === id);
+    if (!source || !layer) return;
+    const imageData = source.toDataURL('image/png');
+    const copy: Layer = { id: makeId(), name: `${layer.name} copy`, visible: true, image: imageData };
+    const at = project.layers.findIndex(item => item.id === id);
+    const layers = [...project.layers];
+    layers.splice(at + 1, 0, copy);
+    const next = { ...project, layers };
+    setProject(next);
+    setActiveLayerId(copy.id);
+    setTimeout(() => {
+      const target = canvasRefs.current[copy.id];
+      if (!target) return;
+      target.width = project.width; target.height = project.height;
+      const image = new Image();
+      image.onload = () => { target.getContext('2d')?.drawImage(image, 0, 0); persist(next); };
+      image.src = imageData;
+    }, 40);
+  };
+  const toggleLayerLock = (id: string) => {
+    if (!project) return;
+    const next = { ...project, layers: project.layers.map(layer => layer.id === id ? { ...layer, locked: !layer.locked } : layer) };
+    setProject(next);
+    persist(next);
+  };
+  const reorderLayers = (sourceId: string, targetId: string) => {
+    if (!project || sourceId === targetId) return;
+    const layers = [...project.layers];
+    const from = layers.findIndex(layer => layer.id === sourceId);
+    const to = layers.findIndex(layer => layer.id === targetId);
+    if (from < 0 || to < 0) return;
+    const [item] = layers.splice(from, 1);
+    layers.splice(to, 0, item);
+    const next = { ...project, layers };
+    setProject(next);
+    persist(next);
+  };
+  const copyActiveLayer = () => {
+    if (!activeLayer) return;
+    clipboard.current = canvasRefs.current[activeLayer.id]?.toDataURL('image/png') ?? null;
+    setActionsMessage(clipboard.current ? 'Layer copied to the local clipboard.' : 'Nothing to copy yet.');
+  };
+  const copyCanvas = () => {
+    if (!project) return;
+    const temp = document.createElement('canvas');
+    temp.width = project.width; temp.height = project.height;
+    const context = temp.getContext('2d');
+    if (!context) return;
+    project.layers.forEach(layer => {
+      if (layer.visible && canvasRefs.current[layer.id]) context.drawImage(canvasRefs.current[layer.id]!, 0, 0);
+    });
+    clipboard.current = temp.toDataURL('image/png');
+    setActionsMessage('Canvas copied to the local clipboard.');
+  };
+  const pasteClipboard = () => {
+    if (!project || !clipboard.current) { setActionsMessage('The app clipboard is empty. Copy a layer or canvas first.'); return; }
+    const imageData = clipboard.current;
+    const layer: Layer = { id: makeId(), name: `Pasted ${project.layers.length + 1}`, visible: true };
+    const next = { ...project, layers: [...project.layers, layer] };
+    setProject(next);
+    setActiveLayerId(layer.id);
+    setTimeout(() => {
+      const canvas = canvasRefs.current[layer.id];
+      if (!canvas) return;
+      const image = new Image();
+      image.onload = () => {
+        canvas.getContext('2d')?.drawImage(image, 0, 0, project.width, project.height);
+        persist(next);
+      };
+      image.src = imageData;
+    }, 40);
+  };
+  const cutActiveLayer = () => {
+    copyActiveLayer();
+    if (activeLayer) clearLayer(activeLayer.id);
+    setActionsMessage('Layer cut. Paste to place it on a new layer.');
+  };
+  const addImageFile = (file?: File) => {
+    if (!file || !project) return;
+    const image = new Image();
+    image.onload = () => {
+      const layer: Layer = { id: makeId(), name: file.name.replace(/\.[^.]+$/, '') || 'Inserted image', visible: true };
+      const next = { ...project, layers: [...project.layers, layer] };
+      setProject(next);
+      setActiveLayerId(layer.id);
+      setTimeout(() => {
+        const canvas = canvasRefs.current[layer.id];
+        if (!canvas) return;
+        canvas.getContext('2d')?.drawImage(image, 0, 0, project.width, project.height);
+        persist(next);
+      }, 40);
+      setActionsMessage('Image added on a new layer.');
+    };
+    image.onerror = () => setActionsMessage('This file could not be opened as an image.');
+    image.src = URL.createObjectURL(file);
+  };
+  const applyText = () => {
+    if (!project || !textDraft.trim()) return;
+    const layer = { id: makeId(), name: 'Text', visible: true };
+    const next = { ...project, layers: [...project.layers, layer] };
+    setProject(next);
+    setActiveLayerId(layer.id);
+    setTimeout(() => {
+      const canvas = canvasRefs.current[layer.id];
+      const ctx = canvas?.getContext('2d');
+      if (!canvas || !ctx) return;
+      ctx.fillStyle = color;
+      ctx.font = `${Math.max(28, brushSize * 4)}px "DM Sans", sans-serif`;
+      ctx.textBaseline = 'middle';
+      ctx.fillText(textDraft, project.width * .12, project.height * .5, project.width * .76);
+      persist(next);
+    }, 40);
+    setTextOpen(false);
+    setActionsMessage('Text added on a new layer.');
+  };
+  const applyCanvasSize = () => {
+    if (!project) return;
+    const width = Math.max(16, Math.min(8192, Math.round(Number(resizeWidth) || project.width)));
+    const height = Math.max(16, Math.min(8192, Math.round(Number(resizeHeight) || project.height)));
+    project.layers.forEach(layer => {
+      const canvas = canvasRefs.current[layer.id];
+      if (!canvas) return;
+      rememberLayer(layer.id);
+      const temp = document.createElement('canvas');
+      temp.width = canvas.width; temp.height = canvas.height;
+      temp.getContext('2d')?.drawImage(canvas, 0, 0);
+      canvas.width = width; canvas.height = height;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      if (canvasOperation === 'Crop') {
+        const sx = Math.max(0, (temp.width - width) / 2);
+        const sy = Math.max(0, (temp.height - height) / 2);
+        const sw = Math.min(width, temp.width);
+        const sh = Math.min(height, temp.height);
+        context.drawImage(temp, sx, sy, sw, sh, Math.max(0, (width - sw) / 2), Math.max(0, (height - sh) / 2), sw, sh);
+      } else context.drawImage(temp, 0, 0, temp.width, temp.height, 0, 0, width, height);
+    });
+    const next = { ...project, width, height };
+    setProject(next);
+    persist(next);
+    setCanvasSizeOpen(false);
+  };
+  const flipCanvas = (horizontal: boolean) => {
+    if (!project) return;
+    project.layers.forEach(layer => {
+      const canvas = canvasRefs.current[layer.id];
+      if (!canvas) return;
+      rememberLayer(layer.id);
+      const temp = document.createElement('canvas');
+      temp.width = canvas.width; temp.height = canvas.height;
+      temp.getContext('2d')?.drawImage(canvas, 0, 0);
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.save();
+      context.translate(horizontal ? canvas.width : 0, horizontal ? 0 : canvas.height);
+      context.scale(horizontal ? -1 : 1, horizontal ? 1 : -1);
+      context.drawImage(temp, 0, 0);
+      context.restore();
+    });
+    persist(project);
+    setActionsMessage(`Canvas flipped ${horizontal ? 'horizontally' : 'vertically'}.`);
+  };
+  const makeFrame = (current = project): AnimationFrame | null => {
+    if (!current) return null;
+    const images: Record<string, string> = {};
+    current.layers.forEach(layer => {
+      const canvas = canvasRefs.current[layer.id];
+      if (canvas) images[layer.id] = canvas.toDataURL('image/png');
+    });
+    return { id: makeId(), images, hold: frameHold, background: frameBackground };
+  };
+  const addAnimationFrame = (duplicate = false) => {
+    if (!project) return;
+    const frame = duplicate && project.animation?.[animationFrameIndex]
+      ? { ...project.animation[animationFrameIndex], id: makeId() }
+      : makeFrame();
+    if (!frame) return;
+    const animation = [...(project.animation ?? []), frame];
+    const next = { ...project, animation };
+    setProject(next);
+    setAnimationFrameIndex(animation.length - 1);
+    persist(next);
+  };
+  const showAnimationFrame = (frame: AnimationFrame, index: number) => {
+    if (!project) return;
+    setAnimationFrameIndex(index);
+    project.layers.forEach(layer => {
+      const canvas = canvasRefs.current[layer.id];
+      if (!canvas) return;
+      const image = new Image();
+      image.onload = () => {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+        ctx?.drawImage(image, 0, 0, canvas.width, canvas.height);
+      };
+      if (frame.images[layer.id]) image.src = frame.images[layer.id];
+    });
+    setFrameHold(frame.hold);
+    setFrameBackground(frame.background);
+  };
+  const deleteAnimationFrame = () => {
+    if (!project?.animation || project.animation.length <= 1) return;
+    const animation = project.animation.filter((_, index) => index !== animationFrameIndex);
+    const next = { ...project, animation };
+    setProject(next);
+    setAnimationFrameIndex(Math.max(0, animationFrameIndex - 1));
+    persist(next);
+  };
+  useEffect(() => {
+    if (!animationPlaying || !project?.animation?.length) return;
+    frameTimer.current = window.setInterval(() => {
+      const nextIndex = (animationFrameIndex + 1) % project.animation!.length;
+      showAnimationFrame(project.animation![nextIndex], nextIndex);
+    }, Math.max(100, (project.animation[animationFrameIndex]?.hold || 6) * 100));
+    return () => window.clearInterval(frameTimer.current);
+  }, [animationPlaying, animationFrameIndex, project?.animation]);
+
+  const openAnimation = () => {
+    if (project && !project.animation?.length) {
+      const first = makeFrame();
+      if (first) setProject({ ...project, animation: [first] });
+    }
+    setAnimationOpen(true);
+    setActionTab('Video');
+    setActionsOpen(true);
+  };
+  const applyQuickShape = () => {
+    if (!project || !activeLayer || !quickShapeDraft) return;
+    const canvas = canvasRefs.current[activeLayer.id];
+    if (!canvas) return;
+    let { from, to } = quickShapeDraft;
+    if (quickShapeSnap && quickShape === 'Line') {
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const length = Math.hypot(dx, dy);
+      const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 12)) * (Math.PI / 12);
+      to = { x: from.x + Math.cos(angle) * length, y: from.y + Math.sin(angle) * length };
+    } else if (quickShapeSnap && quickShape !== 'Line') {
+      const side = Math.max(Math.abs(to.x - from.x), Math.abs(to.y - from.y));
+      to = { x: from.x + Math.sign(to.x - from.x || 1) * side, y: from.y + Math.sign(to.y - from.y || 1) * side };
+    }
+    drawGeometry(canvas.getContext('2d')!, from, to, quickShape, color, brushSize, opacity);
+    const stack = history.current[activeLayer.id] ?? { undo: [], redo: [] };
+    stack.redo = [];
+    history.current[activeLayer.id] = stack;
+    persist(project);
+    setQuickShapeDraft(null);
+    setQuickShapeOpen(false);
+    setHistoryVersion(value => value + 1);
+  };
+  const applySelectedAdjustment = () => {
+    if (!activeLayer || !activeAdjustment) return;
+    const canvas = canvasRefs.current[activeLayer.id];
+    if (!canvas) return;
+    rememberLayer(activeLayer.id);
+    applyCanvasEffect(canvas, activeAdjustment, adjustmentValue);
+    saveNow();
+    setAdjustmentsOpen(false);
+    setActionsMessage(`${activeAdjustment} applied to ${activeLayer.name}.`);
+  };
+  const selectAdjustment = (name: string) => {
+    if (name === 'Liquify') { setAdjustmentsOpen(false); setLiquifyOpen(true); return; }
+    if (name === 'Clone') {
+      setAdjustmentsOpen(false);
+      setCloneMode(true);
+      setCloneSource(null);
+      setActionsMessage('Tap a source point, then tap a destination to clone.');
+      return;
+    }
+    setActiveAdjustment(name);
+    setAdjustmentValue(48);
+  };
+  const applyLiquifyNow = () => {
+    if (!activeLayer) return;
+    const canvas = canvasRefs.current[activeLayer.id];
+    if (!canvas) return;
+    rememberLayer(activeLayer.id);
+    applyLiquify(canvas, liquifyMode, liquifyValues);
+    saveNow();
+    setLiquifyOpen(false);
+    setActionsMessage(`${liquifyMode} liquify applied.`);
+  };
+  const applyTransform = () => {
+    if (!project || !activeLayer) return;
+    const canvas = canvasRefs.current[activeLayer.id];
+    if (!canvas) return;
+    rememberLayer(activeLayer.id);
+    const temp = document.createElement('canvas');
+    temp.width = canvas.width; temp.height = canvas.height;
+    temp.getContext('2d')?.drawImage(canvas, 0, 0);
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    const scale = (transformSnap ? Math.round(transformScale / 5) * 5 : transformScale) / 100;
+    context.save();
+    context.translate(canvas.width / 2, canvas.height / 2);
+    if (transformMode === 'Warp') context.transform(1, 0, (scale - 1) * .5, 1, 0, 0);
+    else if (transformMode === 'Distort') context.scale(scale, 2 - scale);
+    else context.scale(scale, scale);
+    context.imageSmoothingEnabled = interpolation !== 'Nearest neighbor';
+    context.drawImage(temp, -canvas.width / 2, -canvas.height / 2);
+    context.restore();
+    saveNow();
+    setTransformOpen(false);
+  };
+  const updateFrameSettings = (hold: number, background: boolean) => {
+    setFrameHold(hold);
+    setFrameBackground(background);
+    if (!project?.animation?.[animationFrameIndex]) return;
+    const animation = project.animation.map((frame, index) => index === animationFrameIndex ? { ...frame, hold, background } : frame);
+    const next = { ...project, animation };
+    setProject(next);
+    persist(next);
+  };
+  const performCanvasAction = (action: string) => {
+    switch (action) {
+      case 'Crop & Resize': setCanvasOperation('Resize'); setResizeWidth(String(project?.width ?? 2048)); setResizeHeight(String(project?.height ?? 2048)); setCanvasSizeOpen(true); break;
+      case 'Flip horizontal': flipCanvas(true); break;
+      case 'Flip vertical': flipCanvas(false); break;
+      case 'Canvas information': setCanvasInfoOpen(true); break;
+      case 'Animation Assist': if (project) { setProject({ ...project, animation: project.animation ?? [] }); openAnimation(); } break;
+      case 'Page Assist': setPageAssist(value => !value); break;
+      case 'Drawing Guide': setDrawGuide(value => !value); break;
+      case 'Edit Drawing Guide': setDrawGuide(true); setGuideSettingsOpen(true); break;
+      case 'Reference': setReferenceEnabled(value => !value); break;
+    }
+  };
+  const onColorPointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const point = { x: event.clientX, y: event.clientY };
+    colorDragStart.current = point;
+    colorWasDragged.current = false;
+    setColorDrag(point);
+    setColorDropTarget(null);
+  };
+  const onColorPointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!colorDragStart.current) return;
+    const point = { x: event.clientX, y: event.clientY };
+    const delta = Math.hypot(point.x - colorDragStart.current.x, point.y - colorDragStart.current.y);
+    if (delta > 9) colorWasDragged.current = true;
+    if (!colorWasDragged.current) return;
+    setColorDrag(point);
+    const rect = paperRef.current?.getBoundingClientRect();
+    if (rect && point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom) setColorDropTarget(point);
+    else setColorDropTarget(null);
+  };
+  const onColorPointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!colorDragStart.current) return;
+    const rect = paperRef.current?.getBoundingClientRect();
+    const inside = !!rect && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+    if (colorWasDragged.current && inside && rect && activeLayer && !activeLayer.locked) {
+      const canvas = canvasRefs.current[activeLayer.id];
+      if (canvas) {
+        rememberLayer(activeLayer.id);
+        const x = (event.clientX - rect.left) * canvas.width / rect.width;
+        const y = (event.clientY - rect.top) * canvas.height / rect.height;
+        floodFill(canvas, x, y, color, 38);
+        saveNow();
+      }
+    } else if (!colorWasDragged.current) setColorOpen(true);
+    if (colorWasDragged.current) ignoreColorClick.current = true;
+    colorDragStart.current = null;
+    colorWasDragged.current = false;
+    setColorDrag(null);
+    setColorDropTarget(null);
   };
 
   const setLayerVisibility = (id: string) => {
@@ -412,16 +895,23 @@ function AppHome() {
             <button className={`tool-button ${tool === 'brush' ? 'active' : ''}`} title="Brush" aria-label="Brush tool" onClick={() => setTool('brush')} data-testid="tool-brush"><Brush size={19} /></button>
             <button className={`tool-button ${tool === 'smudge' ? 'active' : ''}`} title="Smudge" aria-label="Smudge tool" onClick={() => setTool('smudge')} data-testid="tool-smudge"><Hand size={18} /></button>
             <button className={`tool-button ${tool === 'eraser' ? 'active' : ''}`} title="Eraser" aria-label="Eraser tool" onClick={() => setTool('eraser')} data-testid="tool-eraser"><Eraser size={19} /></button>
-          <button className="tool-button" title="Layers" aria-label="Open layers" onClick={() => setLayersOpen(true)} data-testid="tool-open-layers"><Layers3 size={18} /></button>
-            <button className="tool-button color-tool" title="Choose color" aria-label="Open color picker" style={{ backgroundColor: color }} onClick={() => setColorOpen(true)} data-testid="button-color" />
+            <button className={`tool-button ${tool === 'selection' ? 'active' : ''}`} title="Selection" aria-label="Selection tool" onClick={() => setTool('selection')} data-testid="tool-selection"><Layers3 size={18} /></button>
+            <button className="tool-button color-tool" title="Tap to choose color; drag onto the canvas to fill" aria-label="Selected color: tap to open picker or drag to fill canvas" style={{ backgroundColor: color }}
+              onPointerDown={onColorPointerDown} onPointerMove={onColorPointerMove} onPointerUp={onColorPointerUp}
+              onPointerCancel={() => { colorDragStart.current = null; setColorDrag(null); setColorDropTarget(null); }}
+              onClick={() => { if (ignoreColorClick.current) { ignoreColorClick.current = false; return; } setColorOpen(true); }}
+              data-testid="button-color" />
           </div>
           <div className="tool-sub-row">
             <div className="undo-group">
               <button className="tool-button" aria-label="Undo" title="Undo" onClick={undo} disabled={!hasUndo} data-testid="button-undo"><Undo2 size={18} /></button>
               <button className="tool-button" aria-label="Redo" title="Redo" onClick={redo} disabled={!hasRedo} data-testid="button-redo"><Redo2 size={18} /></button>
             </div>
-            <button className="tool-button" aria-label="Layers" title="Layers" onClick={() => setLayersOpen(true)} data-testid="button-layers"><Layers3 size={18} /></button>
-            <button className="tool-button" aria-label="Export artwork as PNG" title="Export PNG" onClick={exportPng} data-testid="tool-export"><Download size={17} /></button>
+            <button className="tool-button" aria-label="Actions" title="Actions" onClick={() => { setActionTab('Add'); setActionsOpen(true); }} data-testid="button-actions"><Wrench size={17} /></button>
+            <button className={`tool-button ${adjustmentsOpen ? 'active' : ''}`} aria-label="Adjustments" title="Adjustments" onClick={() => setAdjustmentsOpen(true)} data-testid="button-adjustments"><Wand2 size={17} /></button>
+            <button className={`tool-button ${liquifyOpen ? 'active' : ''}`} aria-label="Liquify" title="Liquify" onClick={() => setLiquifyOpen(true)} data-testid="button-liquify"><Hand size={17} /></button>
+            <button className={`tool-button ${transformOpen ? 'active' : ''}`} aria-label="Transform" title="Transform" onClick={() => setTransformOpen(true)} data-testid="button-transform"><Move size={17} /></button>
+            <button className={`tool-button ${quickShapeArmed ? 'active' : ''}`} aria-label="QuickShape" title="QuickShape" onClick={() => { setQuickShapeArmed(value => !value); setTool('brush'); }} data-testid="button-quickshape"><Shapes size={17} /></button>
           </div>
         </div>
         <div className="floating-actions">
@@ -434,6 +924,9 @@ function AppHome() {
         </div>
         <div className="canvas-stage">
           <div className="paper" ref={paperRef} style={{ width: paperSize.width, height: paperSize.height }} data-testid="canvas-paper">
+            {drawGuide && <div className="canvas-guide" style={{ backgroundSize: `${guideSpacing}px ${guideSpacing}px` }} aria-hidden="true" />}
+            {pageAssist && <div className="page-assist-grid" aria-hidden="true" />}
+            {referenceEnabled && referenceUrl && <img className="reference-overlay" src={referenceUrl} alt="Reference image overlay" />}
             {project.layers.map(layer => (
               <canvas key={layer.id} ref={element => { canvasRefs.current[layer.id] = element; }} width={project.width} height={project.height}
                 style={{ display: layer.visible ? 'block' : 'none', pointerEvents: layer.id === activeLayer?.id ? 'auto' : 'none', zIndex: project.layers.indexOf(layer) }}
@@ -443,12 +936,68 @@ function AppHome() {
                 onPointerCancel={layer.id === activeLayer?.id ? onPointerUp : undefined}
                 aria-label={`${layer.name} drawing surface`} data-testid={`canvas-layer-${layer.id}`} />
             ))}
+            {quickShapeDraft && <svg className="shape-preview" viewBox={`0 0 ${project.width} ${project.height}`} preserveAspectRatio="none" aria-hidden="true">
+              {quickShape === 'Line' && <line x1={quickShapeDraft.from.x} y1={quickShapeDraft.from.y} x2={quickShapeDraft.to.x} y2={quickShapeDraft.to.y} />}
+              {quickShape === 'Rectangle' && <rect x={Math.min(quickShapeDraft.from.x, quickShapeDraft.to.x)} y={Math.min(quickShapeDraft.from.y, quickShapeDraft.to.y)} width={Math.abs(quickShapeDraft.from.x - quickShapeDraft.to.x)} height={Math.abs(quickShapeDraft.from.y - quickShapeDraft.to.y)} />}
+              {quickShape === 'Ellipse' && <ellipse cx={(quickShapeDraft.from.x + quickShapeDraft.to.x) / 2} cy={(quickShapeDraft.from.y + quickShapeDraft.to.y) / 2} rx={Math.abs(quickShapeDraft.from.x - quickShapeDraft.to.x) / 2} ry={Math.abs(quickShapeDraft.from.y - quickShapeDraft.to.y) / 2} />}
+            </svg>}
+            {colorDropTarget && colorDrag && <div className="color-drop-mark" style={{ left: colorDropTarget.x - (paperRef.current?.getBoundingClientRect().left ?? 0), top: colorDropTarget.y - (paperRef.current?.getBoundingClientRect().top ?? 0) }}><span style={{ background: color }} /></div>}
           </div>
         </div>
-        <div className="brush-label">{`${tool[0].toUpperCase()}${tool.slice(1)} · ${brushSize}px · ${opacity}%`}</div>
+        {colorDrag && <div className="drag-color-chip" style={{ left: colorDrag.x, top: colorDrag.y, background: color }} aria-hidden="true" />}
+        <div className="brush-label">{actionsMessage || (activeLayer?.locked ? 'Layer locked' : `${tool[0].toUpperCase()}${tool.slice(1)} · ${brushSize}px · ${opacity}%`)}</div>
         <div className="bottom-status">{saving ? 'Saving to this device…' : `${project.width} × ${project.height} px · On this device`}</div>
-        {layersOpen && <LayersSheet project={project} activeLayerId={activeLayer?.id ?? ''} onClose={() => setLayersOpen(false)} onAdd={addLayer} onActive={setActiveLayerId} onVisibility={setLayerVisibility} onRename={renameLayer} onDelete={deleteLayer} canvasRefs={canvasRefs.current} />}
+        <input id="insert-image-file" className="hidden-file" type="file" accept="image/*" onChange={event => { addImageFile(event.target.files?.[0]); event.target.value = ''; }} />
+        <input id="insert-photo-file" className="hidden-file" type="file" accept="image/*" capture="environment" onChange={event => { addImageFile(event.target.files?.[0]); event.target.value = ''; }} />
+        <input id="reference-image-file" className="hidden-file" type="file" accept="image/*" onChange={event => {
+          const file = event.target.files?.[0];
+          if (file) { setReferenceUrl(URL.createObjectURL(file)); setReferenceEnabled(true); }
+          event.target.value = '';
+        }} />
+        {layersOpen && <LayersSheet project={project} activeLayerId={activeLayer?.id ?? ''} onClose={() => setLayersOpen(false)} onAdd={addLayer} onActive={setActiveLayerId} onVisibility={setLayerVisibility} onRename={renameLayer} onDelete={deleteLayer} onLock={toggleLayerLock} onDuplicate={duplicateLayer} onClear={clearLayer} onReorder={reorderLayers} canvasRefs={canvasRefs.current} />}
         {colorOpen && <ColorPicker color={color} onChange={setColor} onClose={() => setColorOpen(false)} />}
+        {actionsOpen && <ActionsSheet tab={actionTab} onTab={setActionTab} onClose={() => setActionsOpen(false)} message={actionsMessage} guide={drawGuide} reference={referenceEnabled} pageAssist={pageAssist}
+          onAction={action => {
+            if (action === 'Insert a file' || action === 'Insert a photo' || action === 'Take a photo') {
+              document.getElementById(action === 'Take a photo' ? 'insert-photo-file' : 'insert-image-file')?.click();
+            } else if (action === 'Add text') { setTextDraft(''); setTextOpen(true); }
+            else if (action === 'Cut') cutActiveLayer();
+            else if (action === 'Copy') copyActiveLayer();
+            else if (action === 'Copy canvas') copyCanvas();
+            else if (action === 'Paste') pasteClipboard();
+            else if (action === 'Share' || action === 'Export PNG') exportPng();
+            else if (action === 'Animation Assist') openAnimation();
+            else if (action === 'Reference') { if (!referenceUrl) document.getElementById('reference-image-file')?.click(); else setReferenceEnabled(value => !value); }
+            else if (action === 'Canvas information') setCanvasInfoOpen(true);
+            else if (action === 'Prefs') setAppPreferencesOpen(true);
+            else if (action === 'Help') setActionsMessage('Draw on the canvas, drag the color dot to fill, and use Actions for canvas tools.');
+            else performCanvasAction(action);
+          }}
+          onExport={exportPng}
+          onVideo={() => { setActionsOpen(false); openAnimation(); }}
+          onPrefs={() => { setActionsOpen(false); setAppPreferencesOpen(true); }}
+          onHelp={() => setActionsMessage('Aeternum Paint keeps artwork on this device. Drag the color control onto the canvas to flood-fill.') }
+          clipboardReady={!!clipboard.current}
+          animationFrames={project.animation ?? []}
+          animationIndex={animationFrameIndex}
+          animationPlaying={animationPlaying}
+          onPlay={() => setAnimationPlaying(value => !value)}
+          onFrame={showAnimationFrame}
+          onAddFrame={() => addAnimationFrame()}
+          onDuplicateFrame={() => addAnimationFrame(true)}
+          onDeleteFrame={deleteAnimationFrame}
+          onFrameOptions={() => setFrameOptionsOpen(true)} />}
+        {adjustmentsOpen && <AdjustmentsSheet active={activeAdjustment} value={adjustmentValue} onValue={setAdjustmentValue} onSelect={selectAdjustment} onApply={applySelectedAdjustment} onClose={() => setAdjustmentsOpen(false)} />}
+        {activeAdjustment && adjustmentsOpen && <div className="adjustment-toolbar"><strong>{activeAdjustment}</strong><label>Amount <input type="range" min="0" max="100" value={adjustmentValue} onChange={event => setAdjustmentValue(Number(event.target.value))} /></label><button onClick={applySelectedAdjustment}>Apply</button></div>}
+        {liquifyOpen && <LiquifySheet mode={liquifyMode} onMode={setLiquifyMode} values={liquifyValues} onValues={setLiquifyValues} onApply={applyLiquifyNow} onCancel={() => setLiquifyOpen(false)} />}
+        {transformOpen && <TransformSheet mode={transformMode} onMode={setTransformMode} scale={transformScale} onScale={setTransformScale} snap={transformSnap} onSnap={setTransformSnap} interpolation={interpolation} onInterpolation={setInterpolation} onApply={applyTransform} onClose={() => setTransformOpen(false)} />}
+        {quickShapeOpen && <QuickShapeSheet shape={quickShape} snap={quickShapeSnap} onSnap={setQuickShapeSnap} onShape={setQuickShape} onApply={applyQuickShape} onClose={() => { setQuickShapeOpen(false); setQuickShapeDraft(null); }} />}
+        {canvasSizeOpen && <CanvasSizeSheet mode={canvasOperation} width={resizeWidth} height={resizeHeight} onWidth={setResizeWidth} onHeight={setResizeHeight} onMode={setCanvasOperation} onApply={applyCanvasSize} onClose={() => setCanvasSizeOpen(false)} />}
+        {canvasInfoOpen && <InfoSheet project={project} onClose={() => setCanvasInfoOpen(false)} />}
+        {guideSettingsOpen && <GuideSheet spacing={guideSpacing} onSpacing={setGuideSpacing} onClose={() => setGuideSettingsOpen(false)} />}
+        {textOpen && <TextSheet value={textDraft} onChange={setTextDraft} onApply={applyText} onClose={() => setTextOpen(false)} />}
+        {frameOptionsOpen && <FrameOptionsSheet hold={frameHold} background={frameBackground} onChange={updateFrameSettings} onDuplicate={() => addAnimationFrame(true)} onDelete={deleteAnimationFrame} onClose={() => setFrameOptionsOpen(false)} />}
+        {appPreferencesOpen && <PreferencesSheet stabilization={brushStabilization} onStabilization={setBrushStabilization} onClose={() => setAppPreferencesOpen(false)} />}
       </main>
     );
   }
@@ -580,9 +1129,10 @@ function NewCanvasSheet({ onClose, onCreate, customWidth, customHeight, setCusto
   );
 }
 
-function LayersSheet({ project, activeLayerId, onClose, onAdd, onActive, onVisibility, onRename, onDelete, canvasRefs }: {
+function LayersSheet({ project, activeLayerId, onClose, onAdd, onActive, onVisibility, onRename, onDelete, onLock, onDuplicate, onClear, onReorder, canvasRefs }: {
   project: Artwork; activeLayerId: string; onClose: () => void; onAdd: () => void; onActive: (id: string) => void;
   onVisibility: (id: string) => void; onRename: (id: string, name: string) => void; onDelete: (id: string) => void;
+  onLock: (id: string) => void; onDuplicate: (id: string) => void; onClear: (id: string) => void; onReorder: (source: string, target: string) => void;
   canvasRefs: Record<string, HTMLCanvasElement | null>;
 }) {
   const [menuId, setMenuId] = useState('');
@@ -594,11 +1144,17 @@ function LayersSheet({ project, activeLayerId, onClose, onAdd, onActive, onVisib
       <header className="layer-head"><h2>Layers</h2><div className="layer-actions">
         <div className="layer-menu">
           <button className="icon-button" aria-label="More layer actions" onClick={() => setMenuId(menuId === 'menu' ? '' : 'menu')} data-testid="button-layer-menu"><MoreHorizontal size={19} /></button>
-          {menuId === 'menu' && <div className="menu-pop"><button onClick={() => { const layer = project.layers.find(item => item.id === activeLayerId); if (layer) onVisibility(layer.id); setMenuId(''); }}>Toggle active visibility</button><button onClick={() => { onDelete(activeLayerId); setMenuId(''); }}>Delete active layer</button></div>}
+          {menuId === 'menu' && <div className="menu-pop">
+            <button onClick={() => { setRenameId(activeLayerId); setMenuId(''); }}>Rename</button>
+            <button onClick={() => { onLock(activeLayerId); setMenuId(''); }}>{project.layers.find(layer => layer.id === activeLayerId)?.locked ? 'Unlock' : 'Lock'}</button>
+            <button onClick={() => { onDuplicate(activeLayerId); setMenuId(''); }}>Duplicate</button>
+            <button onClick={() => { onClear(activeLayerId); setMenuId(''); }}>Clear</button>
+            <button onClick={() => { onDelete(activeLayerId); setMenuId(''); }}>Delete layer</button>
+          </div>}
         </div>
         <button className="icon-button" aria-label="Add layer" onClick={onAdd} data-testid="button-add-layer"><Plus size={20} /></button>
       </div></header>
-      {project.layers.slice().reverse().map(layer => <div key={layer.id} className={`layer-row ${activeLayerId === layer.id ? 'active' : ''}`} onClick={() => onActive(layer.id)} data-testid={`row-layer-${layer.id}`}>
+      {project.layers.slice().reverse().map(layer => <div key={layer.id} className={`layer-row ${activeLayerId === layer.id ? 'active' : ''}`} onClick={() => onActive(layer.id)} draggable onDragStart={event => { event.dataTransfer.setData('text/plain', layer.id); event.dataTransfer.effectAllowed = 'move'; }} onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); onReorder(event.dataTransfer.getData('text/plain'), layer.id); }} data-testid={`row-layer-${layer.id}`}>
         <div className="layer-preview">{canvasRefs[layer.id] && <canvas ref={element => {
           if (!element || !canvasRefs[layer.id]) return;
           const source = canvasRefs[layer.id]!;
@@ -608,12 +1164,191 @@ function LayersSheet({ project, activeLayerId, onClose, onAdd, onActive, onVisib
         {renameId === layer.id ? <input autoFocus className="layer-name" defaultValue={layer.name} aria-label="Rename layer" onBlur={event => { onRename(layer.id, event.target.value); setRenameId(''); }} onKeyDown={event => { if (event.key === 'Enter') { onRename(layer.id, event.currentTarget.value); setRenameId(''); } }} onClick={event => event.stopPropagation()} data-testid={`input-layer-name-${layer.id}`} /> :
           <button className="layer-name" onClick={event => { event.stopPropagation(); setRenameId(layer.id); }} aria-label={`Rename ${layer.name}`} data-testid={`button-rename-layer-${layer.id}`}>{layer.name}</button>}
         <button className="layer-vis" aria-label={`${layer.visible ? 'Hide' : 'Show'} ${layer.name}`} onClick={event => { event.stopPropagation(); onVisibility(layer.id); }} data-testid={`button-visibility-${layer.id}`}>{layer.visible ? <Eye size={17} /> : <EyeOff size={17} />}</button>
-        {activeLayerId === layer.id && <span aria-hidden="true" style={{ fontSize: 10, marginRight: 3 }}>N</span>}
+        {activeLayerId === layer.id && <span aria-label={layer.locked ? 'Layer locked' : 'Normal blend mode'} style={{ fontSize: 10, marginRight: 3 }}>{layer.locked ? 'L' : 'N'}</span>}
       </div>)}
+      {project.layers.find(layer => layer.id === activeLayerId) && <div className="layer-action-strip">
+        <button onClick={() => onLock(activeLayerId)} data-testid="button-lock-layer">{project.layers.find(layer => layer.id === activeLayerId)?.locked ? <Unlock size={15} /> : <Lock size={15} />}{project.layers.find(layer => layer.id === activeLayerId)?.locked ? 'Unlock' : 'Lock'}</button>
+        <button onClick={() => onDuplicate(activeLayerId)} data-testid="button-duplicate-layer"><Copy size={15} />Duplicate</button>
+        <button className="clear-layer" onClick={() => onClear(activeLayerId)} data-testid="button-clear-layer"><X size={15} />Clear</button>
+      </div>}
       <div className="layer-row" style={{ opacity: .7 }}><div className="layer-preview" /><span className="layer-name">Background color</span><Check size={16} /></div>
       <p className="sheet-footer">Tap a layer to draw on it. Press its name to rename.</p>
     </section>
   </>;
+}
+
+type ActionTab = 'Add' | 'Canvas' | 'Share' | 'Video' | 'Prefs' | 'Help';
+function ActionsSheet({ tab, onTab, onClose, onAction, message, clipboardReady, guide, reference, pageAssist, animationFrames, animationIndex, animationPlaying, onPlay, onFrame, onAddFrame, onDuplicateFrame, onDeleteFrame, onFrameOptions }: {
+  tab: ActionTab; onTab: (tab: ActionTab) => void; onClose: () => void; onAction: (action: string) => void; onExport: () => void;
+  onVideo: () => void; onPrefs: () => void; onHelp: () => void; message: string; clipboardReady: boolean; guide: boolean; reference: boolean; pageAssist: boolean;
+  animationFrames: AnimationFrame[]; animationIndex: number; animationPlaying: boolean; onPlay: () => void;
+  onFrame: (frame: AnimationFrame, index: number) => void; onAddFrame: () => void; onDuplicateFrame: () => void; onDeleteFrame: () => void; onFrameOptions: () => void;
+}) {
+  const tabs: ActionTab[] = ['Add', 'Canvas', 'Share', 'Video', 'Prefs', 'Help'];
+  const groups: Record<ActionTab, string[][]> = {
+    Add: [['Insert a file', 'Insert a photo', 'Take a photo', 'Add text'], ['Cut', 'Copy', 'Copy canvas', 'Paste']],
+    Canvas: [['Crop & Resize'], ['Animation Assist', 'Page Assist', 'Drawing Guide', 'Edit Drawing Guide'], ['Reference'], ['Flip horizontal', 'Flip vertical'], ['Canvas information']],
+    Share: [['Export PNG', 'Copy canvas']],
+    Video: [],
+    Prefs: [['Prefs']],
+    Help: [['Help']],
+  };
+  const switches = (action: string) => action === 'Animation Assist' ? animationFrames.length > 0 : action === 'Page Assist' ? pageAssist : action === 'Drawing Guide' ? guide : action === 'Reference' ? reference : false;
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="actions-sheet" role="dialog" aria-modal="true" aria-label="Actions">
+      <div className="sheet-handle" />
+      <header className="actions-heading"><h2>Actions</h2><button className="icon-button" onClick={onClose} aria-label="Close Actions" data-testid="button-close-actions"><X size={18} /></button></header>
+      <div className="action-tabs" role="tablist" aria-label="Action categories">
+        {tabs.map((item, index) => <button key={item} role="tab" aria-selected={tab === item} className={tab === item ? 'selected' : ''} onClick={() => onTab(item)} data-testid={`tab-actions-${item.toLowerCase()}`}>
+          <span className="action-tab-icon">{index === 0 ? <Plus size={18} /> : index === 1 ? <Crop size={18} /> : index === 2 ? <Share2 size={18} /> : index === 3 ? <Film size={18} /> : index === 4 ? <Settings size={18} /> : <HelpCircle size={18} />}</span>{item}
+        </button>)}
+      </div>
+      {tab === 'Video' ? <div className="video-assist">
+        <div className="video-controls">
+          <button className="icon-button" onClick={onPlay} aria-label={animationPlaying ? 'Pause animation' : 'Play animation'} data-testid="button-animation-play">{animationPlaying ? <Pause size={18} /> : <Play size={18} />}</button>
+          <div className="video-frame-count">{animationFrames.length} {animationFrames.length === 1 ? 'frame' : 'frames'}</div>
+          <button className="icon-button" onClick={onFrameOptions} aria-label="Frame options" data-testid="button-frame-options"><MoreHorizontal size={19} /></button>
+          <button className="icon-button" onClick={onAddFrame} aria-label="Add frame" data-testid="button-add-frame"><Plus size={20} /></button>
+        </div>
+        <div className="timeline-strip">
+          {animationFrames.map((frame, index) => <button key={frame.id} className={`timeline-frame ${index === animationIndex ? 'current' : ''}`} onClick={() => onFrame(frame, index)} aria-label={`Show frame ${index + 1}`} data-testid={`button-frame-${index}`}>
+            <span>{index + 1}</span><small>{frame.hold ? `${(frame.hold / 10).toFixed(1)}s` : 'None'}</small>
+          </button>)}
+          {!animationFrames.length && <span className="timeline-empty">Add a frame to begin the animation.</span>}
+        </div>
+        <div className="frame-shortcuts"><button onClick={onDuplicateFrame} disabled={!animationFrames.length} data-testid="button-duplicate-frame"><Copy size={15} />Duplicate frame</button><button onClick={onDeleteFrame} disabled={animationFrames.length <= 1} data-testid="button-delete-frame"><Trash2 size={15} />Delete frame</button></div>
+        <p className="sheet-footer">Tap a frame to edit it. Frames are stored with this artwork.</p>
+      </div> : tab === 'Prefs' ? <div className="action-groups"><button className="action-row" onClick={() => onAction('Prefs')}><Settings size={17} />Preferences<ChevronRight size={16} /></button></div> :
+        tab === 'Help' ? <div className="help-copy"><HelpCircle size={22} /><h3>Keep making.</h3><p>Draw with the floating tools. Drag the color control onto a closed shape to fill it. Actions holds canvas, import, and animation tools.</p><button className="action-row" onClick={() => onAction('Help')}>Drawing help<ChevronRight size={16} /></button></div> :
+          <div className="action-groups">
+            {groups[tab].map((group, groupIndex) => <div className="action-group" key={`${tab}-${groupIndex}`}>
+              {group.map(action => {
+                const isToggle = ['Animation Assist', 'Page Assist', 'Drawing Guide', 'Reference'].includes(action);
+                const isDisabled = action === 'Paste' && !clipboardReady;
+                return <button className={`action-row ${isDisabled ? 'disabled' : ''}`} key={action} disabled={isDisabled} onClick={() => onAction(action)} data-testid={`action-${action.toLowerCase().replace(/[^a-z]+/g, '-')}`}>
+                  <span>{action === 'Edit Drawing Guide' && !guide ? <span className="disabled-copy">Edit Drawing Guide</span> : action}</span>
+                  {isToggle ? <span className={`toggle-control ${switches(action) ? 'on' : ''}`} aria-hidden="true"><i /></span> : action === 'Crop & Resize' || action === 'Canvas information' ? <ChevronRight size={16} /> : action === 'Export PNG' ? <Download size={16} /> : null}
+                </button>;
+              })}
+            </div>)}
+            {message && <p className="action-feedback" role="status">{message}</p>}
+          </div>}
+      {tab === 'Canvas' && <div className="action-footer-note">{message || 'Canvas dimensions and visual guides affect this artwork.'}</div>}
+    </section>
+  </div>;
+}
+
+const adjustmentNames = [
+  'Hue, Saturation, Brightness', 'Color Balance', 'Curves', 'Gradient Map',
+  'Gaussian Blur', 'Motion Blur', 'Perspective Blur', 'Noise', 'Sharpen', 'Bloom',
+  'Glitch', 'Halftone', 'Chromatic Aberration', 'Liquify', 'Clone',
+];
+function AdjustmentsSheet({ active, value, onValue, onSelect, onApply, onClose }: {
+  active: string; value: number; onValue: (value: number) => void; onSelect: (name: string) => void; onApply: () => void; onClose: () => void;
+}) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="actions-sheet adjustments-sheet" role="dialog" aria-modal="true" aria-label="Adjustments">
+      <div className="sheet-handle" /><header className="actions-heading"><h2>Adjustments</h2><button className="icon-button" onClick={onClose} aria-label="Close adjustments"><X size={18} /></button></header>
+      <div className="adjustment-list">
+        {adjustmentNames.map((name, index) => <button key={name} className={`action-row ${active === name ? 'selected' : ''} ${[4,7,13].includes(index) ? 'group-start' : ''}`} onClick={() => onSelect(name)} data-testid={`adjustment-${name.toLowerCase().replace(/[^a-z]+/g, '-')}`}>{name}<ChevronRight size={15} /></button>)}
+      </div>
+      {active && active !== 'Liquify' && active !== 'Clone' && <div className="adjustment-controls"><strong>{active}</strong><label>Amount <span>{value}%</span><input type="range" min="0" max="100" value={value} onChange={event => onValue(Number(event.target.value))} aria-label={`${active} amount`} /></label><button className="primary-action" onClick={onApply}>Apply adjustment</button></div>}
+      <p className="sheet-footer">Changes affect the selected layer and can be undone.</p>
+    </section>
+  </div>;
+}
+
+const liquifyModes: LiquifyMode[] = ['Push', 'Twirl Right', 'Twirl Left', 'Pinch', 'Expand', 'Crystals', 'Edge', 'Reconstruct'];
+function LiquifySheet({ mode, onMode, values, onValues, onApply, onCancel }: {
+  mode: LiquifyMode; onMode: (mode: LiquifyMode) => void; values: { amount: number; size: number; pressure: number; distortion: number; momentum: number };
+  onValues: (values: { amount: number; size: number; pressure: number; distortion: number; momentum: number }) => void; onApply: () => void; onCancel: () => void;
+}) {
+  const [chooseMode, setChooseMode] = useState(false);
+  const slider = (key: keyof typeof values, label: string) => <label className="setting-slider" key={key}><span>{label}</span><b>{values[key] === 100 ? 'Max' : `${values[key]}%`}</b><input type="range" min="0" max="100" value={values[key]} onChange={event => onValues({ ...values, [key]: Number(event.target.value) })} aria-label={`${label} setting`} /></label>;
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onCancel(); }}>
+    <section className="liquify-sheet" role="dialog" aria-modal="true" aria-label="Liquify settings">
+      <div className="sheet-handle" /><header className="actions-heading"><h2>Liquify</h2><button className="icon-button blue-check" onClick={onApply} aria-label="Apply liquify" data-testid="button-apply-liquify"><Check size={21} /></button></header>
+      <div className="liquify-choice">
+        <button className="mode-choice" onClick={() => setChooseMode(value => !value)} aria-expanded={chooseMode} data-testid="button-liquify-mode"><Wand2 size={17} />{mode}<ChevronRight size={17} /></button>
+        <button className="mode-reset" onClick={() => onValues({ amount: 50, size: 70, pressure: 73, distortion: 36, momentum: 85 })} data-testid="button-liquify-reset">Reset</button>
+      </div>
+      {chooseMode && <div className="liquify-mode-list">{liquifyModes.map(item => <button key={item} className={item === mode ? 'chosen' : ''} onClick={() => { onMode(item); setChooseMode(false); }} data-testid={`liquify-mode-${item.toLowerCase().replace(/\s+/g, '-')}`}>{item}{item === mode && <Check size={16} />}</button>)}</div>}
+      <div className="setting-list">{slider('amount', 'Amount')}{slider('size', 'Size')}{slider('pressure', 'Pressure')}{slider('distortion', 'Distortion')}{slider('momentum', 'Momentum')}</div>
+      <div className="sheet-actions"><button onClick={onCancel}>Cancel</button><button className="primary-action" onClick={onApply}>Apply to layer</button></div>
+    </section>
+  </div>;
+}
+
+function TransformSheet({ mode, onMode, scale, onScale, snap, onSnap, interpolation, onInterpolation, onApply, onClose }: {
+  mode: 'Freeform' | 'Uniform' | 'Distort' | 'Warp'; onMode: (mode: 'Freeform' | 'Uniform' | 'Distort' | 'Warp') => void;
+  scale: number; onScale: (value: number) => void; snap: boolean; onSnap: (value: boolean) => void; interpolation: string; onInterpolation: (value: string) => void; onApply: () => void; onClose: () => void;
+}) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="transform-sheet" role="dialog" aria-modal="true" aria-label="Transform">
+      <div className="sheet-handle" /><div className="segmented-control">{(['Freeform', 'Uniform', 'Distort', 'Warp'] as const).map(item => <button key={item} className={mode === item ? 'selected' : ''} onClick={() => onMode(item)} data-testid={`transform-${item.toLowerCase()}`}>{item}</button>)}</div>
+      <label className="setting-slider">Scale <b>{scale}%</b><input type="range" min="20" max="180" value={scale} onChange={event => onScale(Number(event.target.value))} aria-label="Transform scale" /></label>
+      <button className="action-row" onClick={() => onSnap(!snap)} data-testid="toggle-transform-snap">Snap {snap ? 'On · 15°' : 'Off'}<span className={`toggle-control ${snap ? 'on' : ''}`}><i /></span></button>
+      {mode === 'Distort' && <label className="setting-slider">Width <b>{scale}%</b><input type="range" min="20" max="180" value={scale} onChange={event => onScale(Number(event.target.value))} aria-label="Transform width" /></label>}
+      {mode === 'Warp' && <p className="sheet-footer">Warp applies a gentle horizontal perspective shift to the active layer.</p>}
+      <label className="select-setting">Interpolation<select value={interpolation} onChange={event => onInterpolation(event.target.value)} aria-label="Interpolation method"><option>Bilinear</option><option>Bicubic</option><option>Nearest neighbor</option></select></label>
+      <div className="sheet-actions"><button onClick={onClose}>Cancel</button><button className="primary-action" onClick={onApply} data-testid="button-apply-transform">Apply transform</button></div>
+    </section>
+  </div>;
+}
+
+function QuickShapeSheet({ shape, onShape, onApply, onClose }: { shape: 'Line' | 'Ellipse' | 'Rectangle'; onShape: (shape: 'Line' | 'Ellipse' | 'Rectangle') => void; onApply: () => void; onClose: () => void }) {
+  return <div className="overlay quickshape-overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="quickshape-sheet" role="dialog" aria-modal="true" aria-label="QuickShape editing">
+      <div className="sheet-handle" /><header className="actions-heading"><div><h2>QuickShape</h2><p>{shape}</p></div><button className="icon-button blue-check" onClick={onApply} aria-label="Apply QuickShape" data-testid="button-apply-quickshape"><Check size={20} /></button></header>
+      <div className="shape-options">{(['Line', 'Ellipse', 'Rectangle'] as const).map(item => <button key={item} className={item === shape ? 'selected' : ''} onClick={() => onShape(item)} data-testid={`quickshape-${item.toLowerCase()}`}>{item === 'Line' ? 'Line' : item === 'Ellipse' ? 'Ellipse' : 'Rectangle'}</button>)}</div>
+      <div className="sheet-actions"><button onClick={onClose}>Cancel</button><button className="primary-action" onClick={onApply}>Apply shape</button></div>
+    </section>
+  </div>;
+}
+
+function CanvasSizeSheet({ mode, width, height, onMode, onWidth, onHeight, onApply, onClose }: {
+  mode: 'Resize' | 'Crop'; width: string; height: string; onMode: (mode: 'Resize' | 'Crop') => void; onWidth: (value: string) => void; onHeight: (value: string) => void; onApply: () => void; onClose: () => void;
+}) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="sheet compact-sheet" role="dialog" aria-modal="true" aria-label="Crop and resize canvas">
+    <div className="sheet-handle" /><header className="actions-heading"><h2>Crop &amp; Resize</h2><button className="icon-button" onClick={onClose} aria-label="Close crop and resize"><X size={18} /></button></header>
+    <div className="segmented-control"><button className={mode === 'Crop' ? 'selected' : ''} onClick={() => onMode('Crop')}>Crop</button><button className={mode === 'Resize' ? 'selected' : ''} onClick={() => onMode('Resize')}>Resize</button></div>
+    <p className="panel-hint">{mode === 'Crop' ? 'Crop is centered; new pixels are removed from the edges.' : 'Resize scales every layer to the new canvas dimensions.'}</p>
+    <div className="dimension-fields"><label>Width (px)<input type="number" value={width} onChange={event => onWidth(event.target.value)} /></label><label>Height (px)<input type="number" value={height} onChange={event => onHeight(event.target.value)} /></label></div>
+    <div className="sheet-actions"><button onClick={onClose}>Cancel</button><button className="primary-action" onClick={onApply} data-testid="button-apply-canvas-size">Apply</button></div>
+  </section></div>;
+}
+
+function InfoSheet({ project, onClose }: { project: Artwork; onClose: () => void }) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="sheet compact-sheet" role="dialog" aria-modal="true" aria-label="Canvas information">
+    <div className="sheet-handle" /><header className="actions-heading"><h2>Canvas information</h2><button className="icon-button" onClick={onClose} aria-label="Close canvas information"><X size={18} /></button></header>
+    <dl className="info-list"><div><dt>Name</dt><dd>{project.title}</dd></div><div><dt>Dimensions</dt><dd>{project.width} × {project.height} px</dd></div><div><dt>Layers</dt><dd>{project.layers.length}</dd></div><div><dt>Animation frames</dt><dd>{project.animation?.length ?? 0}</dd></div><div><dt>Storage</dt><dd>On this device</dd></div></dl>
+  </section></div>;
+}
+
+function TextSheet({ value, onChange, onApply, onClose }: { value: string; onChange: (value: string) => void; onApply: () => void; onClose: () => void }) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="sheet compact-sheet" role="dialog" aria-modal="true" aria-label="Add text">
+    <div className="sheet-handle" /><header className="actions-heading"><h2>Add text</h2><button className="icon-button" onClick={onClose} aria-label="Close add text"><X size={18} /></button></header>
+    <label className="text-entry">Text<input value={value} onChange={event => onChange(event.target.value)} placeholder="Write something" autoFocus data-testid="input-add-text" /></label>
+    <p className="panel-hint">Text is placed on a new editable layer using the current color.</p>
+    <div className="sheet-actions"><button onClick={onClose}>Cancel</button><button className="primary-action" onClick={onApply} disabled={!value.trim()} data-testid="button-apply-text">Add text layer</button></div>
+  </section></div>;
+}
+
+function FrameOptionsSheet({ hold, background, onChange, onDuplicate, onDelete, onClose }: { hold: number; background: boolean; onChange: (hold: number, background: boolean) => void; onDuplicate: () => void; onDelete: () => void; onClose: () => void }) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="sheet compact-sheet frame-options" role="dialog" aria-modal="true" aria-label="Frame options">
+    <div className="sheet-handle" /><header className="actions-heading"><h2>Frame options</h2><button className="icon-button" onClick={onClose} aria-label="Close frame options"><X size={18} /></button></header>
+    <label className="setting-slider">Hold duration <b>{hold ? `${(hold / 10).toFixed(1)} s` : 'None'}</b><input type="range" min="0" max="50" step="1" value={hold} onChange={event => onChange(Number(event.target.value), background)} aria-label="Frame hold duration" /></label>
+    <button className="action-row" onClick={onDuplicate}>Duplicate</button><button className="action-row" onClick={onDelete}>Delete</button>
+    <button className="action-row" onClick={() => onChange(hold, !background)}>Background <span className={`toggle-control ${background ? 'on' : ''}`}><i /></span></button>
+  </section></div>;
+}
+
+function PreferencesSheet({ stabilization, onStabilization, onClose }: { stabilization: number; onStabilization: (value: number) => void; onClose: () => void }) {
+  return <div className="overlay" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="sheet compact-sheet" role="dialog" aria-modal="true" aria-label="Preferences">
+    <div className="sheet-handle" /><header className="actions-heading"><h2>Preferences</h2><button className="icon-button" onClick={onClose} aria-label="Close preferences"><X size={18} /></button></header>
+    <label className="setting-slider">Brush stabilization <b>{stabilization}%</b><input type="range" min="0" max="90" value={stabilization} onChange={event => onStabilization(Number(event.target.value))} aria-label="Brush stabilization" /></label>
+    <p className="panel-hint">A higher value smooths quick strokes while keeping pressure response.</p>
+  </section></div>;
 }
 
 function ColorPicker({ color, onChange, onClose }: { color: string; onChange: (color: string) => void; onClose: () => void }) {
