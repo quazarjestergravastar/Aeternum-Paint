@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Aeternum Paint"
+description = "A responsive browser drawing app with a Procreate Pocket-inspired artwork gallery, canvas workspace, brush controls, and layers."
+version = "1.0.0"
+id = "artifacts/aeternum-paint"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19815
+
+[services.development]
+run = "pnpm --filter @workspace/aeternum-paint run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/aeternum-paint", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/aeternum-paint/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19815"
+BASE_PATH = "/"
